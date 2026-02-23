@@ -27,6 +27,7 @@ pub mod spec;
 
 pub use builder::{
     build_commands, find_operation, normalize_group, normalize_operation_id, CliConfig,
+    CommandNaming,
 };
 pub use dispatch::dispatch;
 pub use error::DispatchError;
