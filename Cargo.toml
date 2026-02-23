@@ -1,0 +1,22 @@
+[package]
+name = "openapi-clap"
+version = "0.1.0"
+edition = "2021"
+description = "Auto-generate clap CLI commands from OpenAPI specs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ynishi/openapi-clap"
+homepage = "https://github.com/ynishi/openapi-clap"
+readme = "README.md"
+keywords = ["openapi", "clap", "cli", "codegen", "rest"]
+categories = ["command-line-interface", "web-programming"]
+
+[dependencies]
+clap = { version = "4", features = ["string"] }
+openapi-deref = "0.1"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde_json = "1"
+thiserror = "2"
+urlencoding = "2"
+
+[dev-dependencies]
+mockito = "1"
