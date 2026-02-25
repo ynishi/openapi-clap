@@ -6,7 +6,7 @@
 //! # Usage
 //!
 //! ```no_run
-//! use openapi_clap::{CliConfig, build_commands, extract_operations, find_operation, dispatch};
+//! use openapi_clap::{Auth, CliConfig, build_commands, extract_operations, find_operation, dispatch};
 //! use openapi_deref::resolve;
 //! use reqwest::blocking::Client;
 //!
@@ -16,8 +16,22 @@
 //! let ops = extract_operations(&resolved.value);
 //!
 //! let config = CliConfig::new("myapi", "My API CLI", "https://api.example.com");
-//!
 //! let cmd = build_commands(&config, &ops);
+//! let matches = cmd.get_matches();
+//!
+//! let (group, group_matches) = matches.subcommand().expect("subcommand required");
+//! let (op_name, op_matches) = group_matches.subcommand().expect("operation required");
+//!
+//! if let Some(op) = find_operation(&ops, group, op_name, &config) {
+//!     let base_url = op_matches.get_one::<String>("base-url").unwrap();
+//!     let api_key = std::env::var("API_KEY").unwrap_or_default();
+//!     let auth = Auth::Bearer(&api_key);
+//!     let client = Client::new();
+//!     match dispatch(&client, base_url, &auth, op, op_matches) {
+//!         Ok(value) => println!("{}", serde_json::to_string_pretty(&value).unwrap()),
+//!         Err(e) => eprintln!("error: {e}"),
+//!     }
+//! }
 //! ```
 
 pub mod builder;

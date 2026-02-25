@@ -11,7 +11,7 @@ use crate::error::DispatchError;
 use crate::spec::{is_bool_schema, ApiOperation};
 
 /// Authentication method for API requests.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Auth<'a> {
     /// No authentication.
@@ -62,12 +62,13 @@ pub fn dispatch(
         Auth::Basic { username, password } => {
             req = req.basic_auth(*username, *password);
         }
-        Auth::Query { name, value } => {
-            req = req.query(&[(*name, *value)]);
-        }
+        Auth::Query { .. } => {} // applied after operation query params
     }
     if !query_pairs.is_empty() {
         req = req.query(&query_pairs);
+    }
+    if let Auth::Query { name, value } = auth {
+        req = req.query(&[(*name, *value)]);
     }
     for (name, val) in &headers {
         req = req.header(name, val);
@@ -641,6 +642,52 @@ mod tests {
         let auth = Auth::Query {
             name: "api_key",
             value: "my-secret",
+        };
+        let result = dispatch(&client, &server.url(), &auth, &op, &matches);
+        assert!(result.is_ok());
+        mock.assert();
+    }
+
+    #[test]
+    fn dispatch_query_auth_coexists_with_operation_query_params() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/test")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("verbose".into(), "true".into()),
+                mockito::Matcher::UrlEncoded("api_key".into(), "secret".into()),
+            ]))
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create();
+
+        let op = make_full_op(
+            "GET",
+            "/test",
+            Vec::new(),
+            vec![Param {
+                name: "verbose".into(),
+                description: String::new(),
+                required: false,
+                schema: json!({"type": "boolean"}),
+            }],
+            Vec::new(),
+            None,
+        );
+
+        let cmd = Command::new("test").arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .action(ArgAction::SetTrue),
+        );
+        let matches = cmd.try_get_matches_from(["test", "--verbose"]).unwrap();
+
+        let client = Client::new();
+        let auth = Auth::Query {
+            name: "api_key",
+            value: "secret",
         };
         let result = dispatch(&client, &server.url(), &auth, &op, &matches);
         assert!(result.is_ok());
