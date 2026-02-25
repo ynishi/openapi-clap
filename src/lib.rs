@@ -29,7 +29,7 @@ pub use builder::{
     build_commands, find_operation, normalize_group, normalize_operation_id, CliConfig,
     CommandNaming,
 };
-pub use dispatch::dispatch;
+pub use dispatch::{dispatch, Auth};
 pub use error::DispatchError;
 pub use spec::{extract_operations, is_bool_schema, ApiOperation, Param};
 
