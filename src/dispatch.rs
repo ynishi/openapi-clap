@@ -58,23 +58,22 @@ pub enum ResolvedAuth {
     Query { name: String, value: String },
 }
 
-impl ResolvedAuth {
-    /// Create from a borrowed [`Auth`].
-    pub fn from_auth(auth: &Auth<'_>) -> Self {
+impl From<&Auth<'_>> for ResolvedAuth {
+    fn from(auth: &Auth<'_>) -> Self {
         match auth {
             Auth::None => Self::None,
-            Auth::Bearer(token) => Self::Bearer((*token).to_string()),
+            Auth::Bearer(token) => Self::Bearer(token.to_string()),
             Auth::Header { name, value } => Self::Header {
-                name: (*name).to_string(),
-                value: (*value).to_string(),
+                name: name.to_string(),
+                value: value.to_string(),
             },
             Auth::Basic { username, password } => Self::Basic {
-                username: (*username).to_string(),
+                username: username.to_string(),
                 password: password.map(|p| p.to_string()),
             },
             Auth::Query { name, value } => Self::Query {
-                name: (*name).to_string(),
-                value: (*value).to_string(),
+                name: name.to_string(),
+                value: value.to_string(),
             },
         }
     }
@@ -156,7 +155,7 @@ impl PreparedRequest {
             query_pairs,
             headers,
             body,
-            auth: ResolvedAuth::from_auth(auth),
+            auth: ResolvedAuth::from(auth),
         })
     }
 
