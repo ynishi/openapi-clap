@@ -135,14 +135,6 @@ pub fn build_commands(config: &CliConfig, ops: &[ApiOperation]) -> Command {
                 .global(true)
                 .default_value(config.default_base_url.clone())
                 .help("API base URL"),
-        )
-        .arg(
-            Arg::new("output")
-                .long("output")
-                .short('o')
-                .global(true)
-                .default_value("json")
-                .help("Output format: json, compact"),
         );
 
     // Group operations by tag
