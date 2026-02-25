@@ -1,6 +1,6 @@
 [package]
 name = "openapi-clap"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Auto-generate clap CLI commands from OpenAPI specs"
 license = "MIT OR Apache-2.0"
