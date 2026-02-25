@@ -182,6 +182,18 @@ impl PreparedRequest {
         self
     }
 
+    /// Remove all query parameters.
+    pub fn clear_query(mut self) -> Self {
+        self.query_pairs.clear();
+        self
+    }
+
+    /// Remove all headers.
+    pub fn clear_headers(mut self) -> Self {
+        self.headers.clear();
+        self
+    }
+
     /// Build a prepared request from an API operation and clap matches.
     pub fn from_operation(
         base_url: &str,
@@ -1242,6 +1254,26 @@ mod tests {
     }
 
     #[test]
+    fn builder_clear_query_removes_all_pairs() {
+        let req = PreparedRequest::new(Method::GET, "https://example.com")
+            .query("a", "1")
+            .query("b", "2")
+            .clear_query();
+
+        assert!(req.query_pairs.is_empty());
+    }
+
+    #[test]
+    fn builder_clear_headers_removes_all_headers() {
+        let req = PreparedRequest::new(Method::GET, "https://example.com")
+            .header("X-Foo", "bar")
+            .header("X-Baz", "qux")
+            .clear_headers();
+
+        assert!(req.headers.is_empty());
+    }
+
+    #[test]
     fn builder_body_sets_json() {
         let req = PreparedRequest::new(Method::POST, "https://example.com")
             .body(json!({"input": {"prompt": "hello"}}));
@@ -1297,9 +1329,7 @@ mod tests {
             .body(json!({"input": {"prompt": "hi"}}));
 
         let client = Client::new();
-        let result = req.send(&client);
-        assert!(result.is_ok());
-        let val = result.unwrap();
+        let val = req.send(&client).expect("send should succeed");
         assert_eq!(val["id"], "job-123");
         assert_eq!(val["status"], "IN_QUEUE");
         mock.assert();
