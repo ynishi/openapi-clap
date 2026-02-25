@@ -10,11 +10,30 @@ use serde_json::Value;
 use crate::error::DispatchError;
 use crate::spec::{is_bool_schema, ApiOperation};
 
+/// Authentication method for API requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Auth<'a> {
+    /// No authentication.
+    None,
+    /// Bearer token (`Authorization: Bearer <token>`).
+    Bearer(&'a str),
+    /// Custom header (e.g. `X-API-Key: <value>`).
+    Header { name: &'a str, value: &'a str },
+    /// HTTP Basic authentication.
+    Basic {
+        username: &'a str,
+        password: Option<&'a str>,
+    },
+    /// API key sent as a query parameter (e.g. `?api_key=<value>`).
+    Query { name: &'a str, value: &'a str },
+}
+
 /// Execute an API operation based on clap matches.
 pub fn dispatch(
     client: &Client,
     base_url: &str,
-    api_key: &str,
+    auth: &Auth<'_>,
     op: &ApiOperation,
     matches: &clap::ArgMatches,
 ) -> Result<Value, DispatchError> {
@@ -32,11 +51,24 @@ pub fn dispatch(
 
     let mut req = client.request(method, &url);
 
-    if !api_key.is_empty() {
-        req = req.bearer_auth(api_key);
+    match auth {
+        Auth::None => {}
+        Auth::Bearer(token) => {
+            req = req.bearer_auth(token);
+        }
+        Auth::Header { name, value } => {
+            req = req.header(*name, *value);
+        }
+        Auth::Basic { username, password } => {
+            req = req.basic_auth(*username, *password);
+        }
+        Auth::Query { .. } => {} // applied after operation query params
     }
     if !query_pairs.is_empty() {
         req = req.query(&query_pairs);
+    }
+    if let Auth::Query { name, value } = auth {
+        req = req.query(&[(*name, *value)]);
     }
     for (name, val) in &headers {
         req = req.header(name, val);
@@ -364,7 +396,13 @@ mod tests {
             .unwrap();
 
         let client = Client::new();
-        let result = dispatch(&client, &server.url(), "test-key", &op, &matches);
+        let result = dispatch(
+            &client,
+            &server.url(),
+            &Auth::Bearer("test-key"),
+            &op,
+            &matches,
+        );
         assert!(result.is_ok());
         assert_eq!(result.unwrap()["id"], "123");
         mock.assert();
@@ -402,7 +440,7 @@ mod tests {
             .unwrap();
 
         let client = Client::new();
-        let result = dispatch(&client, &server.url(), "key", &op, &matches);
+        let result = dispatch(&client, &server.url(), &Auth::Bearer("key"), &op, &matches);
         assert!(result.is_ok());
         assert_eq!(result.unwrap()["id"], "new");
         mock.assert();
@@ -443,7 +481,7 @@ mod tests {
             .unwrap();
 
         let client = Client::new();
-        let result = dispatch(&client, &server.url(), "key", &op, &matches);
+        let result = dispatch(&client, &server.url(), &Auth::Bearer("key"), &op, &matches);
         assert!(result.is_ok());
         mock.assert();
     }
@@ -476,7 +514,7 @@ mod tests {
         let matches = cmd.try_get_matches_from(["test", "hello world"]).unwrap();
 
         let client = Client::new();
-        let result = dispatch(&client, &server.url(), "key", &op, &matches);
+        let result = dispatch(&client, &server.url(), &Auth::Bearer("key"), &op, &matches);
         assert!(result.is_ok());
         mock.assert();
     }
@@ -496,7 +534,7 @@ mod tests {
         let matches = cmd.try_get_matches_from(["test"]).unwrap();
 
         let client = Client::new();
-        let result = dispatch(&client, &server.url(), "key", &op, &matches);
+        let result = dispatch(&client, &server.url(), &Auth::Bearer("key"), &op, &matches);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -506,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_omits_auth_header_when_api_key_empty() {
+    fn dispatch_omits_auth_header_when_auth_none() {
         let mut server = mockito::Server::new();
         let mock = server
             .mock("GET", "/test")
@@ -522,7 +560,136 @@ mod tests {
         let matches = cmd.try_get_matches_from(["test"]).unwrap();
 
         let client = Client::new();
-        let result = dispatch(&client, &server.url(), "", &op, &matches);
+        let result = dispatch(&client, &server.url(), &Auth::None, &op, &matches);
+        assert!(result.is_ok());
+        mock.assert();
+    }
+
+    #[test]
+    fn dispatch_sends_custom_header_auth() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/test")
+            .match_header("X-API-Key", "my-secret")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create();
+
+        let op = make_full_op("GET", "/test", Vec::new(), Vec::new(), Vec::new(), None);
+
+        let cmd = Command::new("test");
+        let matches = cmd.try_get_matches_from(["test"]).unwrap();
+
+        let client = Client::new();
+        let auth = Auth::Header {
+            name: "X-API-Key",
+            value: "my-secret",
+        };
+        let result = dispatch(&client, &server.url(), &auth, &op, &matches);
+        assert!(result.is_ok());
+        mock.assert();
+    }
+
+    #[test]
+    fn dispatch_sends_basic_auth() {
+        let mut server = mockito::Server::new();
+        // Basic auth header: base64("user:pass") = "dXNlcjpwYXNz"
+        let mock = server
+            .mock("GET", "/test")
+            .match_header("authorization", "Basic dXNlcjpwYXNz")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create();
+
+        let op = make_full_op("GET", "/test", Vec::new(), Vec::new(), Vec::new(), None);
+
+        let cmd = Command::new("test");
+        let matches = cmd.try_get_matches_from(["test"]).unwrap();
+
+        let client = Client::new();
+        let auth = Auth::Basic {
+            username: "user",
+            password: Some("pass"),
+        };
+        let result = dispatch(&client, &server.url(), &auth, &op, &matches);
+        assert!(result.is_ok());
+        mock.assert();
+    }
+
+    #[test]
+    fn dispatch_sends_query_auth() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/test")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "api_key".into(),
+                "my-secret".into(),
+            ))
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create();
+
+        let op = make_full_op("GET", "/test", Vec::new(), Vec::new(), Vec::new(), None);
+
+        let cmd = Command::new("test");
+        let matches = cmd.try_get_matches_from(["test"]).unwrap();
+
+        let client = Client::new();
+        let auth = Auth::Query {
+            name: "api_key",
+            value: "my-secret",
+        };
+        let result = dispatch(&client, &server.url(), &auth, &op, &matches);
+        assert!(result.is_ok());
+        mock.assert();
+    }
+
+    #[test]
+    fn dispatch_query_auth_coexists_with_operation_query_params() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/test")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("verbose".into(), "true".into()),
+                mockito::Matcher::UrlEncoded("api_key".into(), "secret".into()),
+            ]))
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create();
+
+        let op = make_full_op(
+            "GET",
+            "/test",
+            Vec::new(),
+            vec![Param {
+                name: "verbose".into(),
+                description: String::new(),
+                required: false,
+                schema: json!({"type": "boolean"}),
+            }],
+            Vec::new(),
+            None,
+        );
+
+        let cmd = Command::new("test").arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .action(ArgAction::SetTrue),
+        );
+        let matches = cmd.try_get_matches_from(["test", "--verbose"]).unwrap();
+
+        let client = Client::new();
+        let auth = Auth::Query {
+            name: "api_key",
+            value: "secret",
+        };
+        let result = dispatch(&client, &server.url(), &auth, &op, &matches);
         assert!(result.is_ok());
         mock.assert();
     }
@@ -543,7 +710,7 @@ mod tests {
         let matches = cmd.try_get_matches_from(["test"]).unwrap();
 
         let client = Client::new();
-        let result = dispatch(&client, &server.url(), "key", &op, &matches);
+        let result = dispatch(&client, &server.url(), &Auth::Bearer("key"), &op, &matches);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Value::String("plain text response".into()));
     }

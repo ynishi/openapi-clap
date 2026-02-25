@@ -8,6 +8,83 @@ use clap::{Arg, ArgAction, Command};
 
 use crate::spec::{is_bool_schema, ApiOperation};
 
+/// Strategy for generating CLI command names from operation IDs.
+#[derive(Debug, Clone, Copy)]
+pub enum CommandNaming {
+    /// Use normalized operation_id as-is (default, backward compatible).
+    ///
+    /// `"listPods"` under group `"Pods"` → command `"list-pods"`
+    Default,
+    /// Strip group name from command name for shorter commands.
+    ///
+    /// `"listPods"` under group `"Pods"` → command `"list"`
+    StripGroup,
+    /// Custom naming logic.
+    ///
+    /// Arguments: `(normalized_op_id, normalized_group) -> command_name`
+    Custom(fn(&str, &str) -> String),
+}
+
+impl CommandNaming {
+    fn apply(&self, normalized_op_id: &str, normalized_group: &str) -> String {
+        let result = match self {
+            Self::Default => return normalized_op_id.to_string(),
+            Self::StripGroup => strip_group(normalized_op_id, normalized_group),
+            Self::Custom(f) => f(normalized_op_id, normalized_group),
+        };
+        // Guard: empty command name would panic in clap
+        if result.is_empty() {
+            normalized_op_id.to_string()
+        } else {
+            result
+        }
+    }
+}
+
+/// Strip group name (or its singular form) from an operation name.
+///
+/// Tries suffix removal first, then prefix removal.
+/// Falls back to the original name if stripping is not possible.
+fn strip_group(op: &str, group: &str) -> String {
+    // suffix: "list-pods" - "-pods" → "list"
+    if let Some(stripped) = op.strip_suffix(&format!("-{group}")) {
+        if !stripped.is_empty() {
+            return stripped.to_string();
+        }
+    }
+
+    // suffix with singular (trailing 's' removed): "create-pod" when group is "pods"
+    if let Some(singular) = group.strip_suffix('s') {
+        if !singular.is_empty() {
+            if let Some(stripped) = op.strip_suffix(&format!("-{singular}")) {
+                if !stripped.is_empty() {
+                    return stripped.to_string();
+                }
+            }
+        }
+    }
+
+    // prefix: "pods-list" - "pods-" → "list"
+    if let Some(stripped) = op.strip_prefix(&format!("{group}-")) {
+        if !stripped.is_empty() {
+            return stripped.to_string();
+        }
+    }
+
+    if let Some(singular) = group.strip_suffix('s') {
+        if !singular.is_empty() {
+            if let Some(stripped) = op.strip_prefix(&format!("{singular}-")) {
+                if !stripped.is_empty() {
+                    return stripped.to_string();
+                }
+            }
+        }
+    }
+
+    // Can't strip: return as-is
+    op.to_string()
+}
+
 /// Configuration for building a CLI from an OpenAPI spec.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -18,6 +95,8 @@ pub struct CliConfig {
     pub about: String,
     /// Default base URL for the API
     pub default_base_url: String,
+    /// Strategy for generating command names from operation IDs
+    pub command_naming: CommandNaming,
 }
 
 impl CliConfig {
@@ -30,7 +109,14 @@ impl CliConfig {
             name: name.into(),
             about: about.into(),
             default_base_url: default_base_url.into(),
+            command_naming: CommandNaming::Default,
         }
+    }
+
+    /// Set the command naming strategy.
+    pub fn command_naming(mut self, naming: CommandNaming) -> Self {
+        self.command_naming = naming;
+        self
     }
 }
 
@@ -49,14 +135,6 @@ pub fn build_commands(config: &CliConfig, ops: &[ApiOperation]) -> Command {
                 .global(true)
                 .default_value(config.default_base_url.clone())
                 .help("API base URL"),
-        )
-        .arg(
-            Arg::new("output")
-                .long("output")
-                .short('o')
-                .global(true)
-                .default_value("json")
-                .help("Output format: json, compact"),
         );
 
     // Group operations by tag
@@ -67,21 +145,25 @@ pub fn build_commands(config: &CliConfig, ops: &[ApiOperation]) -> Command {
 
     let mut root = root;
     for (group_name, group_ops) in &groups {
-        let mut group_cmd = Command::new(normalize_group(group_name))
+        let norm_group = normalize_group(group_name);
+        let mut group_cmd = Command::new(norm_group.clone())
             .about(format!("Manage {group_name}"))
             .subcommand_required(true)
             .arg_required_else_help(true);
 
-        // Detect duplicate normalized names within this group
+        // Detect duplicate names (after command_naming applied) within this group
         let mut name_count: HashMap<String, usize> = HashMap::new();
         for op in group_ops {
-            *name_count
-                .entry(normalize_operation_id(&op.operation_id))
-                .or_default() += 1;
+            let name = config
+                .command_naming
+                .apply(&normalize_operation_id(&op.operation_id), &norm_group);
+            *name_count.entry(name).or_default() += 1;
         }
 
         for op in group_ops {
-            let base_name = normalize_operation_id(&op.operation_id);
+            let base_name = config
+                .command_naming
+                .apply(&normalize_operation_id(&op.operation_id), &norm_group);
             let cmd_name = if name_count.get(&base_name).copied().unwrap_or(0) > 1 {
                 format!("{}-{}", base_name, op.method.to_lowercase())
             } else {
@@ -101,11 +183,15 @@ pub fn find_operation<'a>(
     ops: &'a [ApiOperation],
     group_name: &str,
     op_name: &str,
+    config: &CliConfig,
 ) -> Option<&'a ApiOperation> {
     ops.iter().find(|o| {
-        let base = normalize_operation_id(&o.operation_id);
+        let norm_group = normalize_group(&o.group);
+        let base = config
+            .command_naming
+            .apply(&normalize_operation_id(&o.operation_id), &norm_group);
         let with_method = format!("{}-{}", base, o.method.to_lowercase());
-        (base == op_name || with_method == op_name) && normalize_group(&o.group) == group_name
+        (base == op_name || with_method == op_name) && norm_group == group_name
     })
 }
 
@@ -227,6 +313,15 @@ mod tests {
         }
     }
 
+    fn default_config() -> CliConfig {
+        CliConfig {
+            name: "testcli".into(),
+            about: "Test".into(),
+            default_base_url: "https://example.com".into(),
+            command_naming: CommandNaming::Default,
+        }
+    }
+
     // -- normalize_operation_id --
 
     #[test]
@@ -293,6 +388,66 @@ mod tests {
         assert_eq!(normalize_group("My..Group"), "my-group");
     }
 
+    // -- strip_group --
+
+    #[test]
+    fn strip_group_suffix_plural() {
+        assert_eq!(strip_group("list-pods", "pods"), "list");
+    }
+
+    #[test]
+    fn strip_group_suffix_singular() {
+        assert_eq!(strip_group("create-pod", "pods"), "create");
+    }
+
+    #[test]
+    fn strip_group_prefix() {
+        assert_eq!(strip_group("pods-list", "pods"), "list");
+    }
+
+    #[test]
+    fn strip_group_no_match_returns_original() {
+        assert_eq!(strip_group("get-status", "pods"), "get-status");
+    }
+
+    #[test]
+    fn strip_group_exact_match_returns_original() {
+        // "pods" stripped from "pods" would be empty → fallback to original
+        assert_eq!(strip_group("pods", "pods"), "pods");
+    }
+
+    #[test]
+    fn strip_group_multi_word_group() {
+        assert_eq!(strip_group("list-user-roles", "user-roles"), "list");
+    }
+
+    // -- CommandNaming --
+
+    #[test]
+    fn command_naming_default_returns_normalized_op_id() {
+        let naming = CommandNaming::Default;
+        assert_eq!(naming.apply("list-pods", "pods"), "list-pods");
+    }
+
+    #[test]
+    fn command_naming_strip_group_removes_suffix() {
+        let naming = CommandNaming::StripGroup;
+        assert_eq!(naming.apply("list-pods", "pods"), "list");
+        assert_eq!(naming.apply("create-pod", "pods"), "create");
+    }
+
+    #[test]
+    fn command_naming_custom() {
+        let naming = CommandNaming::Custom(|op, _group| op.replace("my-", ""));
+        assert_eq!(naming.apply("my-list", "group"), "list");
+    }
+
+    #[test]
+    fn command_naming_custom_empty_result_falls_back() {
+        let naming = CommandNaming::Custom(|_op, _group| String::new());
+        assert_eq!(naming.apply("list-pods", "pods"), "list-pods");
+    }
+
     // -- build_commands --
 
     #[test]
@@ -307,6 +462,7 @@ mod tests {
             name: "testcli".into(),
             about: "Test CLI".into(),
             default_base_url: "https://api.example.com".into(),
+            command_naming: CommandNaming::Default,
         };
 
         let cmd = build_commands(&config, &ops);
@@ -343,6 +499,28 @@ mod tests {
     }
 
     #[test]
+    fn build_commands_with_strip_group() {
+        let ops = vec![
+            make_operation("ListPods", "GET", "/pods", "Pods"),
+            make_operation("CreatePod", "POST", "/pods", "Pods"),
+            make_operation("GetPod", "GET", "/pods/{id}", "Pods"),
+        ];
+
+        let config = CliConfig::new("testcli", "Test", "https://example.com")
+            .command_naming(CommandNaming::StripGroup);
+
+        let cmd = build_commands(&config, &ops);
+        let pods_cmd = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "pods")
+            .unwrap();
+        let pod_subs: Vec<&str> = pods_cmd.get_subcommands().map(|c| c.get_name()).collect();
+        assert!(pod_subs.contains(&"list"), "should have 'list'");
+        assert!(pod_subs.contains(&"create"), "should have 'create'");
+        assert!(pod_subs.contains(&"get"), "should have 'get'");
+    }
+
+    #[test]
     fn build_commands_includes_path_params_as_positional_args() {
         let ops = vec![ApiOperation {
             operation_id: "GetPod".to_string(),
@@ -362,11 +540,7 @@ mod tests {
             body_required: false,
         }];
 
-        let config = CliConfig {
-            name: "testcli".into(),
-            about: "Test".into(),
-            default_base_url: "https://example.com".into(),
-        };
+        let config = default_config();
 
         let cmd = build_commands(&config, &ops);
         let pods = cmd
@@ -398,11 +572,7 @@ mod tests {
             body_required: true,
         }];
 
-        let config = CliConfig {
-            name: "testcli".into(),
-            about: "Test".into(),
-            default_base_url: "https://example.com".into(),
-        };
+        let config = default_config();
 
         let cmd = build_commands(&config, &ops);
         let pods = cmd
@@ -428,11 +598,7 @@ mod tests {
 
     #[test]
     fn build_commands_global_base_url_arg() {
-        let config = CliConfig {
-            name: "testcli".into(),
-            about: "Test".into(),
-            default_base_url: "https://api.example.com".into(),
-        };
+        let config = default_config();
 
         let cmd = build_commands(&config, &[]);
         let base_url_arg = cmd.get_arguments().find(|a| a.get_id() == "base-url");
@@ -443,40 +609,76 @@ mod tests {
 
     #[test]
     fn find_operation_returns_matching_operation() {
+        let config = default_config();
         let ops = vec![
             make_operation("ListPods", "GET", "/pods", "Pods"),
             make_operation("CreatePod", "POST", "/pods", "Pods"),
         ];
 
-        let found = find_operation(&ops, "pods", "create-pod");
+        let found = find_operation(&ops, "pods", "create-pod", &config);
         assert!(found.is_some());
         assert_eq!(found.unwrap().operation_id, "CreatePod");
     }
 
     #[test]
     fn find_operation_returns_none_for_nonexistent() {
+        let config = default_config();
         let ops = vec![make_operation("ListPods", "GET", "/pods", "Pods")];
 
-        let found = find_operation(&ops, "pods", "delete-pod");
+        let found = find_operation(&ops, "pods", "delete-pod", &config);
         assert!(found.is_none());
     }
 
     #[test]
     fn find_operation_returns_none_for_wrong_group() {
+        let config = default_config();
         let ops = vec![make_operation("ListPods", "GET", "/pods", "Pods")];
 
-        let found = find_operation(&ops, "endpoints", "list-pods");
+        let found = find_operation(&ops, "endpoints", "list-pods", &config);
         assert!(found.is_none());
     }
 
     #[test]
     fn find_operation_matches_with_method_suffix() {
+        let config = default_config();
         let ops = vec![
             make_operation("UpdatePod", "PUT", "/pods/{id}", "Pods"),
             make_operation("UpdatePod", "PATCH", "/pods/{id}", "Pods"),
         ];
 
-        let found = find_operation(&ops, "pods", "update-pod-patch");
+        let found = find_operation(&ops, "pods", "update-pod-patch", &config);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().method, "PATCH");
+    }
+
+    #[test]
+    fn find_operation_with_strip_group() {
+        let config = CliConfig::new("testcli", "Test", "https://example.com")
+            .command_naming(CommandNaming::StripGroup);
+        let ops = vec![
+            make_operation("ListPods", "GET", "/pods", "Pods"),
+            make_operation("CreatePod", "POST", "/pods", "Pods"),
+        ];
+
+        let found = find_operation(&ops, "pods", "list", &config);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().operation_id, "ListPods");
+
+        let found = find_operation(&ops, "pods", "create", &config);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().operation_id, "CreatePod");
+    }
+
+    #[test]
+    fn find_operation_with_strip_group_method_suffix() {
+        let config = CliConfig::new("testcli", "Test", "https://example.com")
+            .command_naming(CommandNaming::StripGroup);
+        let ops = vec![
+            make_operation("UpdatePod", "PUT", "/pods/{id}", "Pods"),
+            make_operation("UpdatePod", "PATCH", "/pods/{id}", "Pods"),
+        ];
+
+        let found = find_operation(&ops, "pods", "update-patch", &config);
         assert!(found.is_some());
         assert_eq!(found.unwrap().method, "PATCH");
     }
