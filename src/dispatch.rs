@@ -131,6 +131,57 @@ pub struct PreparedRequest {
 }
 
 impl PreparedRequest {
+    /// Create a new prepared request with the given HTTP method and URL.
+    ///
+    /// Use the builder methods ([`query`](Self::query), [`header`](Self::header),
+    /// [`body`](Self::body), [`auth`](Self::auth)) to set additional fields,
+    /// then call [`send`](Self::send) to execute.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use openapi_clap::dispatch::{PreparedRequest, ResolvedAuth};
+    /// # use reqwest::Method;
+    /// # use serde_json::json;
+    /// let req = PreparedRequest::new(Method::POST, "https://api.example.com/v2/abc/run")
+    ///     .auth(ResolvedAuth::Bearer("my-token".into()))
+    ///     .body(json!({"input": {"prompt": "hello"}}));
+    /// ```
+    pub fn new(method: Method, url: impl Into<String>) -> Self {
+        Self {
+            method,
+            url: url.into(),
+            query_pairs: Vec::new(),
+            headers: Vec::new(),
+            body: None,
+            auth: ResolvedAuth::None,
+        }
+    }
+
+    /// Add a query parameter.
+    pub fn query(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.query_pairs.push((name.into(), value.into()));
+        self
+    }
+
+    /// Add a header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the JSON request body.
+    pub fn body(mut self, body: Value) -> Self {
+        self.body = Some(body);
+        self
+    }
+
+    /// Set the authentication method.
+    pub fn auth(mut self, auth: ResolvedAuth) -> Self {
+        self.auth = auth;
+        self
+    }
+
     /// Build a prepared request from an API operation and clap matches.
     pub fn from_operation(
         base_url: &str,
@@ -1144,5 +1195,140 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported HTTP method"));
+    }
+
+    // -- PreparedRequest builder tests --
+
+    #[test]
+    fn builder_new_sets_method_and_url() {
+        let req = PreparedRequest::new(Method::GET, "https://api.example.com/test");
+
+        assert_eq!(req.method, Method::GET);
+        assert_eq!(req.url, "https://api.example.com/test");
+        assert!(req.query_pairs.is_empty());
+        assert!(req.headers.is_empty());
+        assert!(req.body.is_none());
+        assert_eq!(req.auth, ResolvedAuth::None);
+    }
+
+    #[test]
+    fn builder_query_appends_pairs() {
+        let req = PreparedRequest::new(Method::GET, "https://example.com")
+            .query("limit", "10")
+            .query("offset", "0");
+
+        assert_eq!(
+            req.query_pairs,
+            vec![
+                ("limit".to_string(), "10".to_string()),
+                ("offset".to_string(), "0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn builder_header_appends_headers() {
+        let req = PreparedRequest::new(Method::GET, "https://example.com")
+            .header("X-Request-Id", "abc123")
+            .header("Accept", "application/json");
+
+        assert_eq!(
+            req.headers,
+            vec![
+                ("X-Request-Id".to_string(), "abc123".to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn builder_body_sets_json() {
+        let req = PreparedRequest::new(Method::POST, "https://example.com")
+            .body(json!({"input": {"prompt": "hello"}}));
+
+        assert_eq!(req.body, Some(json!({"input": {"prompt": "hello"}})));
+    }
+
+    #[test]
+    fn builder_auth_sets_resolved_auth() {
+        let req = PreparedRequest::new(Method::POST, "https://example.com")
+            .auth(ResolvedAuth::Bearer("my-token".into()));
+
+        assert_eq!(req.auth, ResolvedAuth::Bearer("my-token".to_string()));
+    }
+
+    #[test]
+    fn builder_chaining_all_fields() {
+        let req = PreparedRequest::new(Method::POST, "https://api.runpod.ai/v2/abc/run")
+            .auth(ResolvedAuth::Bearer("key".into()))
+            .body(json!({"input": {}}))
+            .query("wait", "90000")
+            .header("X-Custom", "value");
+
+        assert_eq!(req.method, Method::POST);
+        assert_eq!(req.url, "https://api.runpod.ai/v2/abc/run");
+        assert_eq!(req.auth, ResolvedAuth::Bearer("key".to_string()));
+        assert_eq!(req.body, Some(json!({"input": {}})));
+        assert_eq!(
+            req.query_pairs,
+            vec![("wait".to_string(), "90000".to_string())]
+        );
+        assert_eq!(
+            req.headers,
+            vec![("X-Custom".to_string(), "value".to_string())]
+        );
+    }
+
+    #[test]
+    fn builder_send_executes_request() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v2/abc/run")
+            .match_header("authorization", "Bearer test-key")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::Json(json!({"input": {"prompt": "hi"}})))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"job-123","status":"IN_QUEUE"}"#)
+            .create();
+
+        let req = PreparedRequest::new(Method::POST, format!("{}/v2/abc/run", server.url()))
+            .auth(ResolvedAuth::Bearer("test-key".into()))
+            .body(json!({"input": {"prompt": "hi"}}));
+
+        let client = Client::new();
+        let result = req.send(&client);
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        assert_eq!(val["id"], "job-123");
+        assert_eq!(val["status"], "IN_QUEUE");
+        mock.assert();
+    }
+
+    #[test]
+    fn builder_send_with_query_auth() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/health")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "api_key".into(),
+                "secret".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create();
+
+        let req = PreparedRequest::new(Method::GET, format!("{}/health", server.url())).auth(
+            ResolvedAuth::Query {
+                name: "api_key".into(),
+                value: "secret".into(),
+            },
+        );
+
+        let client = Client::new();
+        let result = req.send(&client).unwrap();
+        assert_eq!(result["ok"], true);
+        mock.assert();
     }
 }
