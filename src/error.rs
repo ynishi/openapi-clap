@@ -29,4 +29,14 @@ pub enum DispatchError {
         status: reqwest::StatusCode,
         body: String,
     },
+
+    #[error("failed to read JSON from file: {path}")]
+    JsonFileRead {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to read JSON from stdin")]
+    JsonStdinRead(#[source] std::io::Error),
 }

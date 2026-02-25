@@ -43,7 +43,9 @@ pub use builder::{
     build_commands, find_operation, normalize_group, normalize_operation_id, CliConfig,
     CommandNaming,
 };
-pub use dispatch::{build_body, dispatch, Auth, PreparedRequest, ResolvedAuth, SendResponse};
+pub use dispatch::{
+    build_body, dispatch, resolve_json, Auth, PreparedRequest, ResolvedAuth, SendResponse,
+};
 pub use error::DispatchError;
 pub use spec::{extract_operations, is_bool_schema, ApiOperation, Param};
 
