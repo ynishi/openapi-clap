@@ -25,6 +25,8 @@ pub enum Auth<'a> {
         username: &'a str,
         password: Option<&'a str>,
     },
+    /// API key sent as a query parameter (e.g. `?api_key=<value>`).
+    Query { name: &'a str, value: &'a str },
 }
 
 /// Execute an API operation based on clap matches.
@@ -59,6 +61,9 @@ pub fn dispatch(
         }
         Auth::Basic { username, password } => {
             req = req.basic_auth(*username, *password);
+        }
+        Auth::Query { name, value } => {
+            req = req.query(&[(*name, *value)]);
         }
     }
     if !query_pairs.is_empty() {
@@ -606,6 +611,36 @@ mod tests {
         let auth = Auth::Basic {
             username: "user",
             password: Some("pass"),
+        };
+        let result = dispatch(&client, &server.url(), &auth, &op, &matches);
+        assert!(result.is_ok());
+        mock.assert();
+    }
+
+    #[test]
+    fn dispatch_sends_query_auth() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/test")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "api_key".into(),
+                "my-secret".into(),
+            ))
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create();
+
+        let op = make_full_op("GET", "/test", Vec::new(), Vec::new(), Vec::new(), None);
+
+        let cmd = Command::new("test");
+        let matches = cmd.try_get_matches_from(["test"]).unwrap();
+
+        let client = Client::new();
+        let auth = Auth::Query {
+            name: "api_key",
+            value: "my-secret",
         };
         let result = dispatch(&client, &server.url(), &auth, &op, &matches);
         assert!(result.is_ok());
