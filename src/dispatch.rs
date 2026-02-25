@@ -17,11 +17,13 @@
 //! The convenience function [`dispatch`] chains all three steps for callers that
 //! don't need the intermediate representations.
 
+use std::io::Read as _;
 use std::time::Instant;
 
 use reqwest::blocking::Client;
 use reqwest::Method;
 use serde_json::Value;
+use tracing::{debug, trace};
 
 use crate::error::DispatchError;
 use crate::spec::{is_bool_schema, ApiOperation};
@@ -49,7 +51,7 @@ pub enum Auth<'a> {
 ///
 /// Held by [`PreparedRequest`] so the prepared request is `'static` and can be
 /// stored, logged, or sent across threads without lifetime constraints.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResolvedAuth {
     /// No authentication.
@@ -65,6 +67,31 @@ pub enum ResolvedAuth {
     },
     /// API key as query parameter.
     Query { name: String, value: String },
+}
+
+/// Debug output masks secret values to prevent credential leakage in logs.
+impl std::fmt::Debug for ResolvedAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "None"),
+            Self::Bearer(_) => write!(f, "Bearer(***)"),
+            Self::Header { name, .. } => f
+                .debug_struct("Header")
+                .field("name", name)
+                .field("value", &"***")
+                .finish(),
+            Self::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"***")
+                .finish(),
+            Self::Query { name, .. } => f
+                .debug_struct("Query")
+                .field("name", name)
+                .field("value", &"***")
+                .finish(),
+        }
+    }
 }
 
 impl From<&Auth<'_>> for ResolvedAuth {
@@ -283,6 +310,9 @@ impl PreparedRequest {
     /// Use [`SendResponse::into_json`] to check the status and parse the body,
     /// or access [`SendResponse`] fields directly for verbose logging.
     pub fn send(&self, client: &Client) -> Result<SendResponse, DispatchError> {
+        debug!(method = %self.method, url = %self.url, "sending request");
+        trace!(?self.headers, ?self.auth, body_present = self.body.is_some());
+
         let mut req = client.request(self.method.clone(), &self.url);
 
         match &self.auth {
@@ -317,6 +347,12 @@ impl PreparedRequest {
         let headers = resp.headers().clone();
         let text = resp.text().map_err(DispatchError::ResponseRead)?;
         let elapsed = start.elapsed();
+
+        debug!(%status, elapsed_ms = elapsed.as_millis(), "response received");
+        // NOTE: response headers may contain Set-Cookie or auth tokens.
+        // TRACE level is opt-in; callers should avoid persisting trace logs
+        // in shared/public storage.
+        trace!(?headers);
 
         Ok(SendResponse {
             status,
@@ -398,8 +434,7 @@ pub fn build_body(
 
     // --json takes precedence
     if let Some(json_str) = matches.get_one::<String>("json-body") {
-        let val: Value = serde_json::from_str(json_str).map_err(DispatchError::InvalidJsonBody)?;
-        return Ok(Some(val));
+        return Ok(Some(resolve_json(json_str)?));
     }
 
     // --field key=value pairs
@@ -424,6 +459,42 @@ pub fn build_body(
     }
 
     Ok(None)
+}
+
+/// Resolve a JSON value from a raw string, file path, or stdin.
+///
+/// | Input     | Behaviour                                 |
+/// |-----------|-------------------------------------------|
+/// | `"-"`     | Read all of stdin, then parse as JSON     |
+/// | `"@path"` | Read the file at `path`, then parse       |
+/// | otherwise | Parse the string directly as JSON         |
+///
+/// This is the convention used by curl, httpie, and gh CLI.
+///
+/// # Security
+///
+/// File-path inputs (`@...`) are **not** sandboxed. The caller is responsible
+/// for validating or restricting the `input` value when it originates from
+/// untrusted sources.
+pub fn resolve_json(input: &str) -> Result<Value, DispatchError> {
+    let text = match input {
+        "-" => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(DispatchError::JsonStdinRead)?;
+            buf
+        }
+        s if s.starts_with('@') => {
+            let path = &s[1..];
+            std::fs::read_to_string(path).map_err(|e| DispatchError::JsonFileRead {
+                path: path.to_string(),
+                source: e,
+            })?
+        }
+        s => s.to_string(),
+    };
+    serde_json::from_str(&text).map_err(DispatchError::InvalidJsonBody)
 }
 
 #[cfg(test)]
@@ -1438,5 +1509,60 @@ mod tests {
         let val = resp.into_json().expect("should parse JSON");
         assert_eq!(val["ok"], true);
         mock.assert();
+    }
+
+    // -- resolve_json tests --
+
+    #[test]
+    fn resolve_json_parses_raw_string() {
+        let val = resolve_json(r#"{"key":"value"}"#).unwrap();
+        assert_eq!(val, json!({"key": "value"}));
+    }
+
+    #[test]
+    fn resolve_json_reads_file() {
+        let dir = std::env::temp_dir().join("openapi_clap_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_input.json");
+        std::fs::write(&path, r#"{"from":"file"}"#).unwrap();
+
+        let val = resolve_json(&format!("@{}", path.display())).unwrap();
+        assert_eq!(val, json!({"from": "file"}));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn resolve_json_returns_error_for_missing_file() {
+        let result = resolve_json("@/nonexistent/path/file.json");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to read JSON from file"));
+    }
+
+    #[test]
+    fn resolve_json_returns_error_for_invalid_json() {
+        let result = resolve_json("{not valid json}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid JSON"));
+    }
+
+    #[test]
+    fn build_body_json_flag_resolves_file() {
+        let dir = std::env::temp_dir().join("openapi_clap_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("body_test.json");
+        std::fs::write(&path, r#"{"name":"from-file"}"#).unwrap();
+
+        let op = make_op_with_body(Some(json!({"type": "object"})));
+        let matches =
+            build_matches_with_args(&["test", "--json", &format!("@{}", path.display())], true);
+
+        let result = build_body(&op, &matches).unwrap();
+        assert_eq!(result, Some(json!({"name": "from-file"})));
+
+        std::fs::remove_file(&path).unwrap();
     }
 }
