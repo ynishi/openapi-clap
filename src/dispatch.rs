@@ -3,12 +3,21 @@
 //! Takes parsed clap matches and the matching ApiOperation, constructs an HTTP
 //! request, and returns the response.
 //!
-//! # Two-phase dispatch
+//! # Three-phase dispatch
 //!
-//! [`PreparedRequest::from_operation`] builds a fully resolved request that can
-//! be inspected (dry-run, verbose logging) before [`PreparedRequest::send`]
-//! actually transmits it.  The convenience function [`dispatch`] chains both
-//! steps for callers that don't need the intermediate representation.
+//! 1. **Prepare** – [`PreparedRequest::from_operation`] resolves URL, parameters,
+//!    headers, and authentication from an [`ApiOperation`] and clap matches.
+//!    [`build_body`] resolves the request body from `--json` / `--field` arguments.
+//! 2. **Send** – [`PreparedRequest::send`] transmits the request and returns a
+//!    [`SendResponse`] containing full response metadata (status, headers, body,
+//!    elapsed time).
+//! 3. **Consume** – [`SendResponse::into_json`] checks the status code and parses
+//!    the body as JSON.
+//!
+//! The convenience function [`dispatch`] chains all three steps for callers that
+//! don't need the intermediate representations.
+
+use std::time::Instant;
 
 use reqwest::blocking::Client;
 use reqwest::Method;
@@ -79,6 +88,48 @@ impl From<&Auth<'_>> for ResolvedAuth {
     }
 }
 
+/// HTTP response from [`PreparedRequest::send`].
+///
+/// Contains the full response metadata (status, headers, body text, elapsed
+/// time).  Use [`into_json`](Self::into_json) for the common path that checks
+/// the status code and parses JSON, or access individual fields for verbose
+/// logging and dry-run display.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct SendResponse {
+    /// HTTP status code.
+    pub status: reqwest::StatusCode,
+    /// Response headers.
+    pub headers: reqwest::header::HeaderMap,
+    /// Raw response body text.
+    pub body: String,
+    /// Time elapsed from request start to response body fully read.
+    pub elapsed: std::time::Duration,
+}
+
+impl SendResponse {
+    /// Check for a success status and parse the body as JSON.
+    ///
+    /// Returns [`DispatchError::HttpError`] for non-2xx status codes.
+    /// Falls back to [`Value::String`] if the body is not valid JSON.
+    pub fn into_json(self) -> Result<Value, DispatchError> {
+        if !self.status.is_success() {
+            return Err(DispatchError::HttpError {
+                status: self.status,
+                body: self.body,
+            });
+        }
+        Ok(serde_json::from_str(&self.body).unwrap_or(Value::String(self.body)))
+    }
+
+    /// Parse the body as JSON without checking the status code.
+    ///
+    /// Falls back to [`Value::String`] if the body is not valid JSON.
+    pub fn json(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or_else(|_| Value::String(self.body.clone()))
+    }
+}
+
 /// A fully resolved HTTP request ready to be sent or inspected.
 ///
 /// Created by [`PreparedRequest::from_operation`], this struct holds all the
@@ -103,7 +154,8 @@ impl From<&Auth<'_>> for ResolvedAuth {
 /// // Inspect before sending (dry-run / verbose)
 /// eprintln!("{} {}", prepared.method, prepared.url);
 ///
-/// let value = prepared.send(&Client::new())?;
+/// let resp = prepared.send(&Client::new())?;
+/// let value = resp.into_json()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -131,7 +183,75 @@ pub struct PreparedRequest {
 }
 
 impl PreparedRequest {
-    /// Build a prepared request from an API operation and clap matches.
+    /// Create a new prepared request with the given HTTP method and URL.
+    ///
+    /// Use the builder methods ([`query`](Self::query), [`header`](Self::header),
+    /// [`body`](Self::body), [`auth`](Self::auth)) to set additional fields,
+    /// then call [`send`](Self::send) to execute.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use openapi_clap::dispatch::{PreparedRequest, ResolvedAuth};
+    /// # use reqwest::Method;
+    /// # use serde_json::json;
+    /// let req = PreparedRequest::new(Method::POST, "https://api.example.com/v2/abc/run")
+    ///     .auth(ResolvedAuth::Bearer("my-token".into()))
+    ///     .body(json!({"input": {"prompt": "hello"}}));
+    /// ```
+    pub fn new(method: Method, url: impl Into<String>) -> Self {
+        Self {
+            method,
+            url: url.into(),
+            query_pairs: Vec::new(),
+            headers: Vec::new(),
+            body: None,
+            auth: ResolvedAuth::None,
+        }
+    }
+
+    /// Add a query parameter.
+    pub fn query(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.query_pairs.push((name.into(), value.into()));
+        self
+    }
+
+    /// Add a header.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Set the JSON request body.
+    pub fn body(mut self, body: Value) -> Self {
+        self.body = Some(body);
+        self
+    }
+
+    /// Set the authentication method.
+    pub fn auth(mut self, auth: ResolvedAuth) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// Remove all query parameters.
+    pub fn clear_query(mut self) -> Self {
+        self.query_pairs.clear();
+        self
+    }
+
+    /// Remove all headers.
+    pub fn clear_headers(mut self) -> Self {
+        self.headers.clear();
+        self
+    }
+
+    /// Resolve URL, parameters, headers, and authentication from an API
+    /// operation and clap matches.
+    ///
+    /// The request body is **not** included — use [`build_body`] to resolve
+    /// it separately, then chain with [`.body()`](Self::body).  The
+    /// convenience function [`dispatch`] handles this automatically.
     pub fn from_operation(
         base_url: &str,
         auth: &Auth<'_>,
@@ -140,7 +260,6 @@ impl PreparedRequest {
     ) -> Result<Self, DispatchError> {
         let url = build_url(base_url, op, matches);
         let query_pairs = build_query_pairs(op, matches);
-        let body = build_body(op, matches)?;
         let headers = collect_headers(op, matches);
         let method: Method = op
             .method
@@ -154,13 +273,16 @@ impl PreparedRequest {
             url,
             query_pairs,
             headers,
-            body,
+            body: None,
             auth: ResolvedAuth::from(auth),
         })
     }
 
-    /// Send the prepared request using the provided HTTP client.
-    pub fn send(&self, client: &Client) -> Result<Value, DispatchError> {
+    /// Send the prepared request and return full response metadata.
+    ///
+    /// Use [`SendResponse::into_json`] to check the status and parse the body,
+    /// or access [`SendResponse`] fields directly for verbose logging.
+    pub fn send(&self, client: &Client) -> Result<SendResponse, DispatchError> {
         let mut req = client.request(self.method.clone(), &self.url);
 
         match &self.auth {
@@ -189,14 +311,26 @@ impl PreparedRequest {
             req = req.json(body);
         }
 
-        send_request(req)
+        let start = Instant::now();
+        let resp = req.send().map_err(DispatchError::RequestFailed)?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let text = resp.text().map_err(DispatchError::ResponseRead)?;
+        let elapsed = start.elapsed();
+
+        Ok(SendResponse {
+            status,
+            headers,
+            body: text,
+            elapsed,
+        })
     }
 }
 
 /// Execute an API operation based on clap matches.
 ///
-/// Convenience wrapper around [`PreparedRequest::from_operation`] +
-/// [`PreparedRequest::send`].
+/// Convenience wrapper that chains [`PreparedRequest::from_operation`] +
+/// [`build_body`] + [`PreparedRequest::send`] + [`SendResponse::into_json`].
 pub fn dispatch(
     client: &Client,
     base_url: &str,
@@ -204,7 +338,11 @@ pub fn dispatch(
     op: &ApiOperation,
     matches: &clap::ArgMatches,
 ) -> Result<Value, DispatchError> {
-    PreparedRequest::from_operation(base_url, auth, op, matches)?.send(client)
+    let mut req = PreparedRequest::from_operation(base_url, auth, op, matches)?;
+    if let Some(body) = build_body(op, matches)? {
+        req = req.body(body);
+    }
+    req.send(client)?.into_json()
 }
 
 fn build_url(base_url: &str, op: &ApiOperation, matches: &clap::ArgMatches) -> String {
@@ -242,20 +380,15 @@ fn collect_headers(op: &ApiOperation, matches: &clap::ArgMatches) -> Vec<(String
     headers
 }
 
-fn send_request(req: reqwest::blocking::RequestBuilder) -> Result<Value, DispatchError> {
-    let resp = req.send().map_err(DispatchError::RequestFailed)?;
-    let status = resp.status();
-    let text = resp.text().map_err(DispatchError::ResponseRead)?;
-
-    if !status.is_success() {
-        return Err(DispatchError::HttpError { status, body: text });
-    }
-
-    let value: Value = serde_json::from_str(&text).unwrap_or(Value::String(text));
-    Ok(value)
-}
-
-fn build_body(
+/// Resolve the request body from `--json` / `--field` clap arguments.
+///
+/// Returns `Ok(None)` when the operation has no body schema or no body
+/// arguments were provided (and the body is not required).
+///
+/// This is separated from [`PreparedRequest::from_operation`] so that
+/// downstream crates can substitute their own body resolution (e.g.
+/// `@file` / stdin support) while reusing URL and parameter resolution.
+pub fn build_body(
     op: &ApiOperation,
     matches: &clap::ArgMatches,
 ) -> Result<Option<Value>, DispatchError> {
@@ -956,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_request_resolves_body() {
+    fn from_operation_does_not_set_body() {
         let op = make_full_op(
             "POST",
             "/test",
@@ -979,7 +1112,12 @@ mod tests {
             PreparedRequest::from_operation("https://api.example.com", &Auth::None, &op, &matches)
                 .unwrap();
 
-        assert_eq!(prepared.body, Some(json!({"key": "val"})));
+        // from_operation no longer resolves body
+        assert_eq!(prepared.body, None);
+
+        // build_body resolves it separately
+        let body = build_body(&op, &matches).unwrap();
+        assert_eq!(body, Some(json!({"key": "val"})));
     }
 
     #[test]
@@ -1144,5 +1282,161 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported HTTP method"));
+    }
+
+    // -- PreparedRequest builder tests --
+
+    #[test]
+    fn builder_new_sets_method_and_url() {
+        let req = PreparedRequest::new(Method::GET, "https://api.example.com/test");
+
+        assert_eq!(req.method, Method::GET);
+        assert_eq!(req.url, "https://api.example.com/test");
+        assert!(req.query_pairs.is_empty());
+        assert!(req.headers.is_empty());
+        assert!(req.body.is_none());
+        assert_eq!(req.auth, ResolvedAuth::None);
+    }
+
+    #[test]
+    fn builder_query_appends_pairs() {
+        let req = PreparedRequest::new(Method::GET, "https://example.com")
+            .query("limit", "10")
+            .query("offset", "0");
+
+        assert_eq!(
+            req.query_pairs,
+            vec![
+                ("limit".to_string(), "10".to_string()),
+                ("offset".to_string(), "0".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn builder_header_appends_headers() {
+        let req = PreparedRequest::new(Method::GET, "https://example.com")
+            .header("X-Request-Id", "abc123")
+            .header("Accept", "application/json");
+
+        assert_eq!(
+            req.headers,
+            vec![
+                ("X-Request-Id".to_string(), "abc123".to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn builder_clear_query_removes_all_pairs() {
+        let req = PreparedRequest::new(Method::GET, "https://example.com")
+            .query("a", "1")
+            .query("b", "2")
+            .clear_query();
+
+        assert!(req.query_pairs.is_empty());
+    }
+
+    #[test]
+    fn builder_clear_headers_removes_all_headers() {
+        let req = PreparedRequest::new(Method::GET, "https://example.com")
+            .header("X-Foo", "bar")
+            .header("X-Baz", "qux")
+            .clear_headers();
+
+        assert!(req.headers.is_empty());
+    }
+
+    #[test]
+    fn builder_body_sets_json() {
+        let req = PreparedRequest::new(Method::POST, "https://example.com")
+            .body(json!({"input": {"prompt": "hello"}}));
+
+        assert_eq!(req.body, Some(json!({"input": {"prompt": "hello"}})));
+    }
+
+    #[test]
+    fn builder_auth_sets_resolved_auth() {
+        let req = PreparedRequest::new(Method::POST, "https://example.com")
+            .auth(ResolvedAuth::Bearer("my-token".into()));
+
+        assert_eq!(req.auth, ResolvedAuth::Bearer("my-token".to_string()));
+    }
+
+    #[test]
+    fn builder_chaining_all_fields() {
+        let req = PreparedRequest::new(Method::POST, "https://api.runpod.ai/v2/abc/run")
+            .auth(ResolvedAuth::Bearer("key".into()))
+            .body(json!({"input": {}}))
+            .query("wait", "90000")
+            .header("X-Custom", "value");
+
+        assert_eq!(req.method, Method::POST);
+        assert_eq!(req.url, "https://api.runpod.ai/v2/abc/run");
+        assert_eq!(req.auth, ResolvedAuth::Bearer("key".to_string()));
+        assert_eq!(req.body, Some(json!({"input": {}})));
+        assert_eq!(
+            req.query_pairs,
+            vec![("wait".to_string(), "90000".to_string())]
+        );
+        assert_eq!(
+            req.headers,
+            vec![("X-Custom".to_string(), "value".to_string())]
+        );
+    }
+
+    #[test]
+    fn builder_send_executes_request() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v2/abc/run")
+            .match_header("authorization", "Bearer test-key")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::Json(json!({"input": {"prompt": "hi"}})))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"job-123","status":"IN_QUEUE"}"#)
+            .create();
+
+        let req = PreparedRequest::new(Method::POST, format!("{}/v2/abc/run", server.url()))
+            .auth(ResolvedAuth::Bearer("test-key".into()))
+            .body(json!({"input": {"prompt": "hi"}}));
+
+        let client = Client::new();
+        let resp = req.send(&client).expect("send should succeed");
+        assert!(resp.status.is_success());
+        let val = resp.into_json().expect("should parse JSON");
+        assert_eq!(val["id"], "job-123");
+        assert_eq!(val["status"], "IN_QUEUE");
+        mock.assert();
+    }
+
+    #[test]
+    fn builder_send_with_query_auth() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/health")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "api_key".into(),
+                "secret".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create();
+
+        let req = PreparedRequest::new(Method::GET, format!("{}/health", server.url())).auth(
+            ResolvedAuth::Query {
+                name: "api_key".into(),
+                value: "secret".into(),
+            },
+        );
+
+        let client = Client::new();
+        let resp = req.send(&client).expect("send should succeed");
+        let val = resp.into_json().expect("should parse JSON");
+        assert_eq!(val["ok"], true);
+        mock.assert();
     }
 }
