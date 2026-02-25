@@ -2,6 +2,13 @@
 //!
 //! Takes parsed clap matches and the matching ApiOperation, constructs an HTTP
 //! request, and returns the response.
+//!
+//! # Two-phase dispatch
+//!
+//! [`PreparedRequest::from_operation`] builds a fully resolved request that can
+//! be inspected (dry-run, verbose logging) before [`PreparedRequest::send`]
+//! actually transmits it.  The convenience function [`dispatch`] chains both
+//! steps for callers that don't need the intermediate representation.
 
 use reqwest::blocking::Client;
 use reqwest::Method;
@@ -29,7 +36,167 @@ pub enum Auth<'a> {
     Query { name: &'a str, value: &'a str },
 }
 
+/// Owned authentication resolved from [`Auth`].
+///
+/// Held by [`PreparedRequest`] so the prepared request is `'static` and can be
+/// stored, logged, or sent across threads without lifetime constraints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResolvedAuth {
+    /// No authentication.
+    None,
+    /// Bearer token.
+    Bearer(String),
+    /// Custom header.
+    Header { name: String, value: String },
+    /// HTTP Basic authentication.
+    Basic {
+        username: String,
+        password: Option<String>,
+    },
+    /// API key as query parameter.
+    Query { name: String, value: String },
+}
+
+impl From<&Auth<'_>> for ResolvedAuth {
+    fn from(auth: &Auth<'_>) -> Self {
+        match auth {
+            Auth::None => Self::None,
+            Auth::Bearer(token) => Self::Bearer(token.to_string()),
+            Auth::Header { name, value } => Self::Header {
+                name: name.to_string(),
+                value: value.to_string(),
+            },
+            Auth::Basic { username, password } => Self::Basic {
+                username: username.to_string(),
+                password: password.map(|p| p.to_string()),
+            },
+            Auth::Query { name, value } => Self::Query {
+                name: name.to_string(),
+                value: value.to_string(),
+            },
+        }
+    }
+}
+
+/// A fully resolved HTTP request ready to be sent or inspected.
+///
+/// Created by [`PreparedRequest::from_operation`], this struct holds all the
+/// data needed to execute an HTTP request.  Consumers can inspect the fields
+/// for dry-run display, verbose logging, or request modification before
+/// calling [`send`](PreparedRequest::send).
+///
+/// # Example
+///
+/// ```no_run
+/// # use openapi_clap::dispatch::{PreparedRequest, Auth};
+/// # use openapi_clap::spec::ApiOperation;
+/// # use reqwest::blocking::Client;
+/// # fn example(op: &ApiOperation, matches: &clap::ArgMatches) -> Result<(), Box<dyn std::error::Error>> {
+/// let prepared = PreparedRequest::from_operation(
+///     "https://api.example.com",
+///     &Auth::Bearer("token"),
+///     op,
+///     matches,
+/// )?;
+///
+/// // Inspect before sending (dry-run / verbose)
+/// eprintln!("{} {}", prepared.method, prepared.url);
+///
+/// let value = prepared.send(&Client::new())?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PreparedRequest {
+    /// HTTP method (GET, POST, etc.).
+    pub method: Method,
+    /// Fully resolved URL with path parameters substituted.
+    pub url: String,
+    /// Query parameters from the API operation.
+    ///
+    /// Auth query parameters (see [`ResolvedAuth::Query`]) are kept in the
+    /// [`auth`](Self::auth) field and applied separately during
+    /// [`send`](Self::send).
+    pub query_pairs: Vec<(String, String)>,
+    /// Headers from the API operation.
+    ///
+    /// Auth headers are kept in the [`auth`](Self::auth) field.
+    pub headers: Vec<(String, String)>,
+    /// JSON request body, if any.
+    pub body: Option<Value>,
+    /// Resolved authentication.
+    pub auth: ResolvedAuth,
+}
+
+impl PreparedRequest {
+    /// Build a prepared request from an API operation and clap matches.
+    pub fn from_operation(
+        base_url: &str,
+        auth: &Auth<'_>,
+        op: &ApiOperation,
+        matches: &clap::ArgMatches,
+    ) -> Result<Self, DispatchError> {
+        let url = build_url(base_url, op, matches);
+        let query_pairs = build_query_pairs(op, matches);
+        let body = build_body(op, matches)?;
+        let headers = collect_headers(op, matches);
+        let method: Method = op
+            .method
+            .parse()
+            .map_err(|_| DispatchError::UnsupportedMethod {
+                method: op.method.clone(),
+            })?;
+
+        Ok(Self {
+            method,
+            url,
+            query_pairs,
+            headers,
+            body,
+            auth: ResolvedAuth::from(auth),
+        })
+    }
+
+    /// Send the prepared request using the provided HTTP client.
+    pub fn send(&self, client: &Client) -> Result<Value, DispatchError> {
+        let mut req = client.request(self.method.clone(), &self.url);
+
+        match &self.auth {
+            ResolvedAuth::None => {}
+            ResolvedAuth::Bearer(token) => {
+                req = req.bearer_auth(token);
+            }
+            ResolvedAuth::Header { name, value } => {
+                req = req.header(name, value);
+            }
+            ResolvedAuth::Basic { username, password } => {
+                req = req.basic_auth(username, password.as_deref());
+            }
+            ResolvedAuth::Query { .. } => {} // applied after operation query params
+        }
+        if !self.query_pairs.is_empty() {
+            req = req.query(&self.query_pairs);
+        }
+        if let ResolvedAuth::Query { name, value } = &self.auth {
+            req = req.query(&[(name, value)]);
+        }
+        for (name, val) in &self.headers {
+            req = req.header(name, val);
+        }
+        if let Some(body) = &self.body {
+            req = req.json(body);
+        }
+
+        send_request(req)
+    }
+}
+
 /// Execute an API operation based on clap matches.
+///
+/// Convenience wrapper around [`PreparedRequest::from_operation`] +
+/// [`PreparedRequest::send`].
 pub fn dispatch(
     client: &Client,
     base_url: &str,
@@ -37,47 +204,7 @@ pub fn dispatch(
     op: &ApiOperation,
     matches: &clap::ArgMatches,
 ) -> Result<Value, DispatchError> {
-    let url = build_url(base_url, op, matches);
-    let query_pairs = build_query_pairs(op, matches);
-    let body = build_body(op, matches)?;
-    let headers = collect_headers(op, matches);
-
-    let method: Method = op
-        .method
-        .parse()
-        .map_err(|_| DispatchError::UnsupportedMethod {
-            method: op.method.clone(),
-        })?;
-
-    let mut req = client.request(method, &url);
-
-    match auth {
-        Auth::None => {}
-        Auth::Bearer(token) => {
-            req = req.bearer_auth(token);
-        }
-        Auth::Header { name, value } => {
-            req = req.header(*name, *value);
-        }
-        Auth::Basic { username, password } => {
-            req = req.basic_auth(*username, *password);
-        }
-        Auth::Query { .. } => {} // applied after operation query params
-    }
-    if !query_pairs.is_empty() {
-        req = req.query(&query_pairs);
-    }
-    if let Auth::Query { name, value } = auth {
-        req = req.query(&[(*name, *value)]);
-    }
-    for (name, val) in &headers {
-        req = req.header(name, val);
-    }
-    if let Some(body) = body {
-        req = req.json(&body);
-    }
-
-    send_request(req)
+    PreparedRequest::from_operation(base_url, auth, op, matches)?.send(client)
 }
 
 fn build_url(base_url: &str, op: &ApiOperation, matches: &clap::ArgMatches) -> String {
@@ -713,5 +840,309 @@ mod tests {
         let result = dispatch(&client, &server.url(), &Auth::Bearer("key"), &op, &matches);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Value::String("plain text response".into()));
+    }
+
+    // -- PreparedRequest unit tests --
+
+    #[test]
+    fn prepared_request_resolves_url_and_method() {
+        let op = make_full_op(
+            "GET",
+            "/pods/{podId}",
+            vec![Param {
+                name: "podId".into(),
+                description: String::new(),
+                required: true,
+                schema: json!({"type": "string"}),
+            }],
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let cmd = Command::new("test").arg(Arg::new("podId").required(true));
+        let matches = cmd.try_get_matches_from(["test", "abc"]).unwrap();
+
+        let prepared =
+            PreparedRequest::from_operation("https://api.example.com", &Auth::None, &op, &matches)
+                .unwrap();
+
+        assert_eq!(prepared.method, Method::GET);
+        assert_eq!(prepared.url, "https://api.example.com/pods/abc");
+        assert!(prepared.query_pairs.is_empty());
+        assert!(prepared.headers.is_empty());
+        assert!(prepared.body.is_none());
+        assert_eq!(prepared.auth, ResolvedAuth::None);
+    }
+
+    #[test]
+    fn prepared_request_collects_query_pairs() {
+        let op = make_full_op(
+            "GET",
+            "/test",
+            Vec::new(),
+            vec![
+                Param {
+                    name: "limit".into(),
+                    description: String::new(),
+                    required: false,
+                    schema: json!({"type": "integer"}),
+                },
+                Param {
+                    name: "verbose".into(),
+                    description: String::new(),
+                    required: false,
+                    schema: json!({"type": "boolean"}),
+                },
+            ],
+            Vec::new(),
+            None,
+        );
+        let cmd = Command::new("test")
+            .arg(Arg::new("limit").long("limit").action(ArgAction::Set))
+            .arg(
+                Arg::new("verbose")
+                    .long("verbose")
+                    .action(ArgAction::SetTrue),
+            );
+        let matches = cmd
+            .try_get_matches_from(["test", "--limit", "10", "--verbose"])
+            .unwrap();
+
+        let prepared =
+            PreparedRequest::from_operation("https://api.example.com", &Auth::None, &op, &matches)
+                .unwrap();
+
+        assert_eq!(
+            prepared.query_pairs,
+            vec![
+                ("limit".to_string(), "10".to_string()),
+                ("verbose".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_request_collects_headers() {
+        let op = make_full_op(
+            "GET",
+            "/test",
+            Vec::new(),
+            Vec::new(),
+            vec![Param {
+                name: "X-Request-Id".into(),
+                description: String::new(),
+                required: false,
+                schema: json!({"type": "string"}),
+            }],
+            None,
+        );
+        let cmd = Command::new("test").arg(
+            Arg::new("X-Request-Id")
+                .long("X-Request-Id")
+                .action(ArgAction::Set),
+        );
+        let matches = cmd
+            .try_get_matches_from(["test", "--X-Request-Id", "req-42"])
+            .unwrap();
+
+        let prepared =
+            PreparedRequest::from_operation("https://api.example.com", &Auth::None, &op, &matches)
+                .unwrap();
+
+        assert_eq!(
+            prepared.headers,
+            vec![("X-Request-Id".to_string(), "req-42".to_string())]
+        );
+    }
+
+    #[test]
+    fn prepared_request_resolves_body() {
+        let op = make_full_op(
+            "POST",
+            "/test",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(json!({"type": "object"})),
+        );
+        let cmd = Command::new("test").arg(
+            Arg::new("json-body")
+                .long("json")
+                .short('j')
+                .action(ArgAction::Set),
+        );
+        let matches = cmd
+            .try_get_matches_from(["test", "--json", r#"{"key":"val"}"#])
+            .unwrap();
+
+        let prepared =
+            PreparedRequest::from_operation("https://api.example.com", &Auth::None, &op, &matches)
+                .unwrap();
+
+        assert_eq!(prepared.body, Some(json!({"key": "val"})));
+    }
+
+    #[test]
+    fn prepared_request_resolves_bearer_auth() {
+        let op = make_full_op("GET", "/test", Vec::new(), Vec::new(), Vec::new(), None);
+        let cmd = Command::new("test");
+        let matches = cmd.try_get_matches_from(["test"]).unwrap();
+
+        let prepared = PreparedRequest::from_operation(
+            "https://api.example.com",
+            &Auth::Bearer("my-token"),
+            &op,
+            &matches,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.auth, ResolvedAuth::Bearer("my-token".to_string()));
+    }
+
+    #[test]
+    fn prepared_request_resolves_basic_auth() {
+        let op = make_full_op("GET", "/test", Vec::new(), Vec::new(), Vec::new(), None);
+        let cmd = Command::new("test");
+        let matches = cmd.try_get_matches_from(["test"]).unwrap();
+
+        let prepared = PreparedRequest::from_operation(
+            "https://api.example.com",
+            &Auth::Basic {
+                username: "user",
+                password: Some("pass"),
+            },
+            &op,
+            &matches,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.auth,
+            ResolvedAuth::Basic {
+                username: "user".to_string(),
+                password: Some("pass".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn prepared_request_resolves_header_auth() {
+        let op = make_full_op("GET", "/test", Vec::new(), Vec::new(), Vec::new(), None);
+        let cmd = Command::new("test");
+        let matches = cmd.try_get_matches_from(["test"]).unwrap();
+
+        let prepared = PreparedRequest::from_operation(
+            "https://api.example.com",
+            &Auth::Header {
+                name: "X-API-Key",
+                value: "secret",
+            },
+            &op,
+            &matches,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.auth,
+            ResolvedAuth::Header {
+                name: "X-API-Key".to_string(),
+                value: "secret".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn prepared_request_resolves_query_auth_separate_from_query_pairs() {
+        let op = make_full_op(
+            "GET",
+            "/test",
+            Vec::new(),
+            vec![Param {
+                name: "verbose".into(),
+                description: String::new(),
+                required: false,
+                schema: json!({"type": "boolean"}),
+            }],
+            Vec::new(),
+            None,
+        );
+        let cmd = Command::new("test").arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .action(ArgAction::SetTrue),
+        );
+        let matches = cmd.try_get_matches_from(["test", "--verbose"]).unwrap();
+
+        let prepared = PreparedRequest::from_operation(
+            "https://api.example.com",
+            &Auth::Query {
+                name: "api_key",
+                value: "secret",
+            },
+            &op,
+            &matches,
+        )
+        .unwrap();
+
+        // Auth query param is NOT in query_pairs — it's in auth
+        assert_eq!(
+            prepared.query_pairs,
+            vec![("verbose".to_string(), "true".to_string())]
+        );
+        assert_eq!(
+            prepared.auth,
+            ResolvedAuth::Query {
+                name: "api_key".to_string(),
+                value: "secret".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn prepared_request_url_encodes_path_params() {
+        let op = make_full_op(
+            "GET",
+            "/items/{name}",
+            vec![Param {
+                name: "name".into(),
+                description: String::new(),
+                required: true,
+                schema: json!({"type": "string"}),
+            }],
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let cmd = Command::new("test").arg(Arg::new("name").required(true));
+        let matches = cmd.try_get_matches_from(["test", "hello world"]).unwrap();
+
+        let prepared =
+            PreparedRequest::from_operation("https://api.example.com", &Auth::None, &op, &matches)
+                .unwrap();
+
+        assert_eq!(prepared.url, "https://api.example.com/items/hello%20world");
+    }
+
+    #[test]
+    fn prepared_request_returns_error_for_unsupported_method() {
+        // Method must contain invalid HTTP token characters to fail parsing
+        let op = make_full_op(
+            "NOT VALID",
+            "/test",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        let cmd = Command::new("test");
+        let matches = cmd.try_get_matches_from(["test"]).unwrap();
+
+        let result =
+            PreparedRequest::from_operation("https://api.example.com", &Auth::None, &op, &matches);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported HTTP method"));
     }
 }
